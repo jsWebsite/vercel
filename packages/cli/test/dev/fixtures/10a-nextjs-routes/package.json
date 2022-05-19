@@ -1,7 +1,7 @@
 {
   "private": true,
   "dependencies": {
-    "next": "9.5.3",
+    "next": "12.1.0",
     "react": "16.13.1",
     "react-dom": "16.13.1"
   }
