@@ -4,8 +4,13 @@ import fetch from 'node-fetch';
 import getPort from 'get-port';
 import isPortReachable from 'is-port-reachable';
 import frameworks, { Framework } from '@vercel/frameworks';
-import type { ChildProcess, SpawnOptions } from 'child_process';
-import { existsSync, readFileSync, statSync, readdirSync } from 'fs';
+import {
+  spawn,
+  spawnSync,
+  type ChildProcess,
+  type SpawnOptions,
+} from 'child_process';
+import { existsSync, readFileSync, statSync, readdirSync, mkdirSync } from 'fs';
 import { cpus } from 'os';
 import {
   BuildV2,
@@ -15,11 +20,12 @@ import {
   PrepareCache,
   glob,
   download,
-  spawnAsync,
   execCommand,
   spawnCommand,
   runNpmInstall,
-  getNodeBinPath,
+  getEnvForPackageManager,
+  getPrefixedEnvVars,
+  getNodeBinPaths,
   runBundleInstall,
   runPipInstall,
   runPackageJsonScript,
@@ -29,13 +35,23 @@ import {
   debug,
   NowBuildError,
   scanParentDirs,
+  cloneEnv,
+  getInstalledPackageVersion,
 } from '@vercel/build-utils';
-import type { Route, Source } from '@vercel/routing-utils';
+import type { Route, RouteWithSrc } from '@vercel/routing-utils';
 import * as BuildOutputV1 from './utils/build-output-v1';
+import * as BuildOutputV2 from './utils/build-output-v2';
 import * as BuildOutputV3 from './utils/build-output-v3';
 import * as GatsbyUtils from './utils/gatsby';
 import * as NuxtUtils from './utils/nuxt';
 import type { ImagesConfig, BuildConfig } from './utils/_shared';
+import treeKill from 'tree-kill';
+import {
+  detectFrameworkRecord,
+  LocalFileSystemDetector,
+} from '@vercel/fs-detectors';
+import { getHugoUrl } from './utils/hugo';
+import { once } from 'events';
 
 const sleep = (n: number) => new Promise(resolve => setTimeout(resolve, n));
 
@@ -115,7 +131,7 @@ function getCommand(
   name: 'install' | 'build' | 'dev',
   pkg: PackageJson | null,
   config: Config,
-  framework: Framework | undefined
+  framework?: Framework
 ): string | null {
   if (!config.zeroConfig) {
     return null;
@@ -128,7 +144,11 @@ function getCommand(
     return propValue;
   }
 
-  if (pkg) {
+  const ignorePackageJsonScript =
+    name === 'build' &&
+    framework?.settings.buildCommand.ignorePackageJsonScript;
+
+  if (pkg && !ignorePackageJsonScript) {
     const scriptName = getScriptName(pkg, name, config);
 
     if (hasScript(scriptName, pkg)) {
@@ -160,19 +180,19 @@ const nowDevScriptPorts = new Map<string, number>();
 const nowDevChildProcesses = new Set<ChildProcess>();
 
 ['SIGINT', 'SIGTERM'].forEach(signal => {
-  process.once(signal as NodeJS.Signals, () => {
+  process.once(signal as NodeJS.Signals, async () => {
     for (const child of nowDevChildProcesses) {
       debug(
         `Got ${signal}, killing dev server child process (pid=${child.pid})`
       );
-      process.kill(child.pid!, signal);
+      await new Promise(resolve => treeKill(child.pid!, signal, resolve));
     }
     process.exit(0);
   });
 });
 
-const getDevRoute = (srcBase: string, devPort: number, route: Source) => {
-  const basic: Source = {
+const getDevRoute = (srcBase: string, devPort: number, route: RouteWithSrc) => {
+  const basic: RouteWithSrc = {
     src: `${srcBase}${route.src}`,
     dest: `http://localhost:${devPort}${route.dest}`,
   };
@@ -247,7 +267,12 @@ function getFramework(
   return framework;
 }
 
-async function fetchBinary(url: string, framework: string, version: string) {
+async function fetchBinary(
+  url: string,
+  framework: string,
+  version: string,
+  dest = '/usr/local/bin'
+) {
   const res = await fetch(url);
   if (res.status === 404) {
     throw new NowBuildError({
@@ -256,15 +281,54 @@ async function fetchBinary(url: string, framework: string, version: string) {
       link: 'https://vercel.link/framework-versioning',
     });
   }
-  await spawnAsync(`curl -sSL ${url} | tar -zx -C /usr/local/bin`, [], {
-    shell: true,
+  const cp = spawn('tar', ['-zx', '-C', dest], {
+    stdio: ['pipe', 'ignore', 'ignore'],
   });
+  res.body.pipe(cp.stdin);
+  const [exitCode] = await once(cp, 'exit');
+  if (exitCode !== 0) {
+    throw new Error(
+      `Extraction of ${framework} failed (exit code ${exitCode})`
+    );
+  }
+}
+
+async function getUpdatedDistPath(
+  framework: Framework | undefined,
+  outputDirPrefix: string,
+  entrypointDir: string,
+  distPath: string,
+  config: Config
+): Promise<string | undefined> {
+  if (framework) {
+    const outputDirName = config.outputDirectory
+      ? config.outputDirectory
+      : await framework.getOutputDirName(outputDirPrefix);
+
+    return path.join(outputDirPrefix, outputDirName);
+  }
+
+  if (!config || !config.distDir) {
+    // Select either `dist` or `public` as directory
+    const publicPath = path.join(entrypointDir, 'public');
+
+    if (
+      !existsSync(distPath) &&
+      existsSync(publicPath) &&
+      statSync(publicPath).isDirectory()
+    ) {
+      return publicPath;
+    }
+  }
+
+  return undefined;
 }
 
 export const build: BuildV2 = async ({
   files,
   entrypoint,
   workPath,
+  repoRootPath,
   config,
   meta = {},
 }) => {
@@ -282,6 +346,12 @@ export const build: BuildV2 = async ({
   const pkg = getPkg(entrypoint, workPath);
   const devScript = pkg ? getScriptName(pkg, 'dev', config) : null;
   const framework = getFramework(config, pkg);
+  const localFileSystemDetector = new LocalFileSystemDetector(workPath);
+  const { detectedVersion = null } =
+    (await detectFrameworkRecord({
+      fs: localFileSystemDetector,
+      frameworkList: frameworks,
+    })) ?? {};
   const devCommand = getCommand('dev', pkg, config, framework);
   const buildCommand = getCommand('build', pkg, config, framework);
   const installCommand = getCommand('install', pkg, config, framework);
@@ -299,13 +369,19 @@ export const build: BuildV2 = async ({
     if (config.zeroConfig) {
       const { HUGO_VERSION, ZOLA_VERSION, GUTENBERG_VERSION } = process.env;
 
-      if (HUGO_VERSION && !meta.isDev) {
-        console.log('Installing Hugo version ' + HUGO_VERSION);
-        const [major, minor] = HUGO_VERSION.split('.').map(Number);
-        const isOldVersion = major === 0 && minor < 43;
-        const prefix = isOldVersion ? `hugo_` : `hugo_extended_`;
-        const url = `https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/${prefix}${HUGO_VERSION}_Linux-64bit.tar.gz`;
-        await fetchBinary(url, 'Hugo', HUGO_VERSION);
+      if ((HUGO_VERSION || framework?.slug === 'hugo') && !meta.isDev) {
+        const hugoVersion = HUGO_VERSION || '0.58.2';
+        const hugoDir = path.join(
+          workPath,
+          `.vercel/cache/hugo-v${hugoVersion}-${process.platform}-${process.arch}`
+        );
+        if (!existsSync(hugoDir)) {
+          console.log('Installing Hugo version ' + hugoVersion);
+          const url = await getHugoUrl(hugoVersion);
+          mkdirSync(hugoDir, { recursive: true });
+          await fetchBinary(url, 'Hugo', hugoVersion, hugoDir);
+        }
+        process.env.PATH = `${hugoDir}${path.delimiter}${process.env.PATH}`;
       }
 
       if (ZOLA_VERSION && !meta.isDev) {
@@ -333,18 +409,34 @@ export const build: BuildV2 = async ({
         `Detected ${framework.name} framework. Optimizing your deployment...`
       );
 
-      if (process.env.VERCEL_URL) {
-        const { envPrefix } = framework;
-        if (envPrefix) {
-          Object.keys(process.env)
-            .filter(key => key.startsWith('VERCEL_'))
-            .forEach(key => {
-              const newKey = `${envPrefix}${key}`;
-              if (!(newKey in process.env)) {
-                process.env[newKey] = process.env[key];
-              }
-            });
-        }
+      const prefixedEnvs = getPrefixedEnvVars({
+        envPrefix: framework.envPrefix,
+        envs: process.env,
+      });
+
+      for (const [key, value] of Object.entries(prefixedEnvs)) {
+        process.env[key] = value;
+      }
+
+      const speedInsightsVersion = getInstalledPackageVersion(
+        '@vercel/speed-insights'
+      );
+
+      const isSpeedInsightsInstalled = Boolean(speedInsightsVersion);
+
+      if (
+        isSpeedInsightsInstalled &&
+        process.env.VERCEL_ANALYTICS_ID &&
+        ['next', 'nuxtjs', 'gatsby'].includes(framework.slug || '')
+      ) {
+        delete process.env.VERCEL_ANALYTICS_ID;
+        debug(
+          `Removed VERCEL_ANALYTICS_ID from the environment because we detected the @vercel/speed-insights package`
+        );
+      }
+
+      if (framework.slug === 'gatsby') {
+        await GatsbyUtils.injectPlugins(detectedVersion, entrypointDir);
       }
 
       if (process.env.VERCEL_ANALYTICS_ID) {
@@ -353,15 +445,12 @@ export const build: BuildV2 = async ({
           path.dirname(entrypoint)
         );
         switch (framework.slug) {
-          case 'gatsby':
-            await GatsbyUtils.injectVercelAnalyticsPlugin(frameworkDirectory);
-            break;
           case 'nuxtjs':
             await NuxtUtils.injectVercelAnalyticsPlugin(frameworkDirectory);
             break;
           default:
             debug(
-              `No analytics plugin injected for framework ${framework.slug}`
+              `No Web Vitals plugin injected for framework ${framework.slug}`
             );
             break;
         }
@@ -393,25 +482,21 @@ export const build: BuildV2 = async ({
       spawnOpts.env.CI = 'false';
     }
 
-    const { cliType, lockfileVersion } = await scanParentDirs(entrypointDir);
+    const {
+      cliType,
+      lockfileVersion,
+      packageJsonPackageManager,
+      turboSupportsCorepackHome,
+    } = await scanParentDirs(entrypointDir, true);
 
-    if (cliType === 'npm') {
-      if (
-        typeof lockfileVersion === 'number' &&
-        lockfileVersion >= 2 &&
-        (nodeVersion?.major || 0) < 16
-      ) {
-        // Ensure that npm 7 is at the beginning of the `$PATH`
-        spawnOpts.env.PATH = `/node16/bin-npm7:${spawnOpts.env.PATH}`;
-        console.log('Detected `package-lock.json` generated by npm 7...');
-      }
-    } else if (cliType === 'pnpm') {
-      if (typeof lockfileVersion === 'number' && lockfileVersion === 5.4) {
-        // Ensure that pnpm 7 is at the beginning of the `$PATH`
-        spawnOpts.env.PATH = `/pnpm7/node_modules/.bin:${spawnOpts.env.PATH}`;
-        console.log('Detected `pnpm-lock.yaml` generated by pnpm 7...');
-      }
-    }
+    spawnOpts.env = getEnvForPackageManager({
+      cliType,
+      lockfileVersion,
+      packageJsonPackageManager,
+      nodeVersion,
+      env: spawnOpts.env || {},
+      turboSupportsCorepackHome,
+    });
 
     if (meta.isDev) {
       debug('Skipping dependency installation because dev mode is enabled');
@@ -431,17 +516,8 @@ export const build: BuildV2 = async ({
       } else if (typeof installCommand === 'string') {
         if (installCommand.trim()) {
           console.log(`Running "install" command: \`${installCommand}\`...`);
-          const env: Record<string, string> = {
-            YARN_NODE_LINKER: 'node-modules',
-            ...spawnOpts.env,
-          };
-
           await execCommand(installCommand, {
             ...spawnOpts,
-
-            // Yarn v2 PnP mode may be activated, so force
-            // "node-modules" linker style
-            env,
             cwd: entrypointDir,
           });
           // Its not clear which command was run, so assume all
@@ -456,8 +532,7 @@ export const build: BuildV2 = async ({
           debug('Detected Gemfile');
           printInstall();
           const opts = {
-            env: {
-              ...process.env,
+            env: cloneEnv(process.env, {
               // See more: https://github.com/rubygems/rubygems/blob/a82d04856deba58be6b90f681a5e42a7c0f2baa7/bundler/lib/bundler/man/bundle-config.1.ronn
               BUNDLE_BIN: 'vendor/bin',
               BUNDLE_CACHE_PATH: 'vendor/cache',
@@ -467,7 +542,7 @@ export const build: BuildV2 = async ({
               BUNDLE_SILENCE_ROOT_WARNING: '1',
               BUNDLE_DISABLE_SHARED_GEMS: '1',
               BUNDLE_DISABLE_VERSION_CHECK: '1',
-            },
+            }),
           };
           await runBundleInstall(workPath, [], opts, meta);
           isBundleInstall = true;
@@ -490,14 +565,23 @@ export const build: BuildV2 = async ({
       }
     }
 
+    if (framework?.slug === 'gatsby') {
+      await GatsbyUtils.createPluginSymlinks(entrypointDir);
+    }
+
     let gemHome: string | undefined = undefined;
     const pathList = [];
 
     if (isNpmInstall || (pkg && (buildCommand || devCommand))) {
-      const nodeBinPath = await getNodeBinPath({ cwd: entrypointDir });
-      pathList.push(nodeBinPath); // Add `./node_modules/.bin`
+      const nodeBinPaths = getNodeBinPaths({
+        start: entrypointDir,
+        base: repoRootPath,
+      });
+      pathList.push(...nodeBinPaths); // Add `./node_modules/.bin`
       debug(
-        `Added "${nodeBinPath}" to PATH env because a package.json file was found`
+        `Added "${nodeBinPaths.join(
+          path.delimiter
+        )}" to PATH env because a package.json file was found`
       );
     }
 
@@ -506,12 +590,13 @@ export const build: BuildV2 = async ({
       pathList.push(vendorBin); // Add `./vendor/bin`
       debug(`Added "${vendorBin}" to PATH env because a Gemfile was found`);
       const dir = path.join(workPath, 'vendor', 'bundle', 'ruby');
-      const rubyVersion =
-        existsSync(dir) && statSync(dir).isDirectory()
-          ? readdirSync(dir)[0]
-          : '';
-      if (rubyVersion) {
-        gemHome = path.join(dir, rubyVersion); // Add `./vendor/bundle/ruby/2.7.0`
+      const rubyVersion = spawnSync(
+        'ruby',
+        ['-e', 'print "#{ RUBY_VERSION }"'],
+        { encoding: 'utf8' }
+      );
+      if (rubyVersion.status === 0 && typeof rubyVersion.stdout === 'string') {
+        gemHome = path.join(dir, rubyVersion.stdout.trim());
         debug(`Set GEM_HOME="${gemHome}" because a Gemfile was found`);
       }
     }
@@ -559,7 +644,7 @@ export const build: BuildV2 = async ({
         const cmd = devCommand || `yarn run ${devScript}`;
         const child: ChildProcess = spawnCommand(cmd, opts);
 
-        child.on('exit', () => nowDevScriptPorts.delete(entrypoint));
+        child.on('close', () => nowDevScriptPorts.delete(entrypoint));
         nowDevChildProcesses.add(child);
 
         // Wait for the server to have listened on `$PORT`, after which we
@@ -600,77 +685,69 @@ export const build: BuildV2 = async ({
         debug(`Executing "${buildCommand}"`);
       }
 
-      const found =
-        typeof buildCommand === 'string'
-          ? await execCommand(buildCommand, {
-              ...spawnOpts,
+      try {
+        const found =
+          typeof buildCommand === 'string'
+            ? await execCommand(buildCommand, {
+                ...spawnOpts,
 
-              // Yarn v2 PnP mode may be activated, so force
-              // "node-modules" linker style
-              env: {
-                YARN_NODE_LINKER: 'node-modules',
-                ...spawnOpts.env,
-              },
+                // Yarn v2 PnP mode may be activated, so force
+                // "node-modules" linker style
+                env: {
+                  YARN_NODE_LINKER: 'node-modules',
+                  ...spawnOpts.env,
+                },
 
-              cwd: entrypointDir,
-            })
-          : await runPackageJsonScript(
-              entrypointDir,
-              ['vercel-build', 'now-build', 'build'],
-              spawnOpts
-            );
+                cwd: entrypointDir,
+              })
+            : await runPackageJsonScript(
+                entrypointDir,
+                ['vercel-build', 'now-build', 'build'],
+                spawnOpts
+              );
 
-      if (!found) {
-        throw new Error(
-          `Missing required "${
-            buildCommand || 'vercel-build'
-          }" script in "${entrypoint}"`
-        );
+        if (!found) {
+          throw new Error(
+            `Missing required "${
+              buildCommand || 'vercel-build'
+            }" script in "${entrypoint}"`
+          );
+        }
+      } finally {
+        if (framework?.slug === 'gatsby') {
+          GatsbyUtils.cleanupGatsbyFiles(entrypointDir);
+        }
       }
 
       const outputDirPrefix = path.join(workPath, path.dirname(entrypoint));
+      distPath =
+        (await getUpdatedDistPath(
+          framework,
+          outputDirPrefix,
+          entrypointDir,
+          distPath,
+          config
+        )) || distPath;
 
       // If the Build Command or Framework output files according to the
       // Build Output v3 API, then stop processing here in `static-build`
       // since the output is already in its final form.
-      const buildOutputPath = await BuildOutputV3.getBuildOutputDirectory(
-        outputDirPrefix
-      );
-
-      if (buildOutputPath) {
+      const buildOutputPathV3 =
+        await BuildOutputV3.getBuildOutputDirectory(outputDirPrefix);
+      if (buildOutputPathV3) {
         // Ensure that `vercel build` is being used for this Deployment
-        if (!meta.cliVersion) {
-          let buildCommandName: string;
-          if (buildCommand) buildCommandName = `"${buildCommand}"`;
-          else if (framework) buildCommandName = framework.name;
-          else buildCommandName = 'the "build" script';
-          throw new Error(
-            `Detected Build Output v3 from ${buildCommandName}, but this Deployment is not using \`vercel build\`.\nPlease set the \`ENABLE_VC_BUILD=1\` environment variable.`
-          );
-        }
-        return {
-          buildOutputVersion: 3,
-          buildOutputPath,
-        };
+        return BuildOutputV3.createBuildOutput(
+          meta,
+          buildCommand,
+          buildOutputPathV3,
+          framework
+        );
       }
 
-      if (framework) {
-        const outputDirName = config.outputDirectory
-          ? config.outputDirectory
-          : await framework.getOutputDirName(outputDirPrefix);
-
-        distPath = path.join(outputDirPrefix, outputDirName);
-      } else if (!config || !config.distDir) {
-        // Select either `dist` or `public` as directory
-        const publicPath = path.join(entrypointDir, 'public');
-
-        if (
-          !existsSync(distPath) &&
-          existsSync(publicPath) &&
-          statSync(publicPath).isDirectory()
-        ) {
-          distPath = publicPath;
-        }
+      const buildOutputPathV2 =
+        await BuildOutputV2.getBuildOutputDirectory(outputDirPrefix);
+      if (buildOutputPathV2) {
+        return await BuildOutputV2.createBuildOutput(workPath);
       }
 
       const extraOutputs = await BuildOutputV1.readBuildOutputDirectory({
@@ -707,7 +784,7 @@ export const build: BuildV2 = async ({
         }
 
         let ignore: string[] = [];
-        if (config.zeroConfig && config.outputDirectory === '.') {
+        if (config.outputDirectory === '.' || config.distDir === '.') {
           ignore = [
             '.env',
             '.env.*',

@@ -1,6 +1,8 @@
 import chalk from 'chalk';
-import Client from '../client';
-import { Domain } from '../../types';
+import type Client from '../client';
+import type { Domain } from '@vercel-internals/types';
+import { isAPIError } from '../errors-ts';
+import output from '../../output-manager';
 
 type Response = {
   domain: Domain;
@@ -11,7 +13,7 @@ export async function getDomain(
   contextName: string,
   domainName: string
 ) {
-  client.output.spinner(
+  output.spinner(
     `Fetching domain ${domainName} under ${chalk.bold(contextName)}`
   );
   try {
@@ -20,11 +22,11 @@ export async function getDomain(
     );
 
     return domain;
-  } catch (error) {
-    if (error.status < 500) {
-      return error;
+  } catch (err: unknown) {
+    if (isAPIError(err) && err.status < 500) {
+      return err;
     }
 
-    throw error;
+    throw err;
   }
 }

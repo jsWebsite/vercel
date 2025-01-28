@@ -1,10 +1,12 @@
 import { join } from 'path';
 import { promises as fs } from 'fs';
+import { BuildResultV2, Meta } from '@vercel/build-utils';
+import { Framework } from '@vercel/frameworks';
 
 const BUILD_OUTPUT_DIR = '.vercel/output';
 
 /**
- * Returns the path to the Build Output v3 directory when the
+ * Returns the path to the Build Output API v3 directory when the
  * `config.json` file was created by the framework / build script,
  * or `undefined` if the framework did not create the v3 output.
  */
@@ -33,4 +35,28 @@ export async function readConfig(
     if (err.code !== 'ENOENT') throw err;
   }
   return undefined;
+}
+
+export function createBuildOutput(
+  meta: Meta,
+  buildCommand: string | null,
+  buildOutputPath: string,
+  framework: Framework | undefined
+): BuildResultV2 {
+  if (meta.isDev) {
+    let buildCommandName: string;
+
+    if (buildCommand) buildCommandName = `"${buildCommand}"`;
+    else if (framework) buildCommandName = framework.name;
+    else buildCommandName = 'the "build" script';
+
+    throw new Error(
+      `Detected Build Output v3 from ${buildCommandName}, but it is not supported for \`vercel dev\`. Please set the Development Command in your Project Settings.`
+    );
+  }
+
+  return {
+    buildOutputVersion: 3,
+    buildOutputPath,
+  };
 }
