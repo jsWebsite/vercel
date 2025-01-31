@@ -5,16 +5,17 @@ const { join, relative, sep } = require('path');
 const allPackages = [
   'routing-utils',
   'frameworks',
+  'fs-detectors',
   'build-utils',
   'static-config',
   'client',
   'next',
-  'node-bridge',
   'node',
   'go',
   'python',
   'ruby',
   'redwood',
+  'remix',
   'static-build',
   'cli',
 ];
@@ -77,8 +78,8 @@ function runScript(pkgName, script) {
       pkgJson = null;
     }
     if (pkgJson && pkgJson.scripts && pkgJson.scripts[script]) {
-      console.log(`\n[${pkgName}] Running yarn ${script}`);
-      const child = spawn('yarn', [script], {
+      console.log(`\n[${pkgName}] Running pnpm ${script}`);
+      const child = spawn('pnpm', [script], {
         cwd,
         stdio: 'inherit',
         shell: true,

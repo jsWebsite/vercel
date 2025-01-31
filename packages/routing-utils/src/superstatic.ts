@@ -3,8 +3,57 @@
  * See https://github.com/firebase/superstatic#configuration
  */
 import { parse as parseUrl, format as formatUrl } from 'url';
-import { pathToRegexp, compile, Key } from 'path-to-regexp';
+import {
+  pathToRegexp as pathToRegexpCurrent,
+  compile,
+  Key,
+} from 'path-to-regexp';
+import { pathToRegexp as pathToRegexpUpdated } from 'path-to-regexp-updated';
 import { Route, Redirect, Rewrite, HasField, Header } from './types';
+
+// run the updated version of path-to-regexp, compare the results, and log if different
+function pathToRegexp(
+  callerId: string,
+  path: string,
+  keys?: Key[],
+  options?: { strict: boolean; sensitive: boolean; delimiter: string }
+) {
+  const currentRegExp = pathToRegexpCurrent(path, keys, options);
+
+  try {
+    const currentKeys = keys;
+    const newKeys: Key[] = [];
+    const newRegExp = pathToRegexpUpdated(path, newKeys, options);
+
+    // FORCE_PATH_TO_REGEXP_LOG can be used to force these logs to render
+    // for verification that they show up in the build logs as expected
+
+    const isDiffRegExp = currentRegExp.toString() !== newRegExp.toString();
+    if (process.env.FORCE_PATH_TO_REGEXP_LOG || isDiffRegExp) {
+      const message = JSON.stringify({
+        path,
+        currentRegExp: currentRegExp.toString(),
+        newRegExp: newRegExp.toString(),
+      });
+      console.error(`[vc] PATH TO REGEXP PATH DIFF @ #${callerId}: ${message}`);
+    }
+
+    const isDiffKeys = keys?.toString() !== newKeys?.toString();
+    if (process.env.FORCE_PATH_TO_REGEXP_LOG || isDiffKeys) {
+      const message = JSON.stringify({
+        isDiffKeys,
+        currentKeys,
+        newKeys,
+      });
+      console.error(`[vc] PATH TO REGEXP KEYS DIFF @ #${callerId}: ${message}`);
+    }
+  } catch (err) {
+    const error = err as Error;
+    console.error(`[vc] PATH TO REGEXP ERROR @ #${callerId}: ${error.message}`);
+  }
+
+  return currentRegExp;
+}
 
 const UN_NAMED_SEGMENT = '__UN_NAMED_SEGMENT__';
 
@@ -51,6 +100,9 @@ export function convertRedirects(
   return redirects.map(r => {
     const { src, segments } = sourceToRegex(r.source);
     const hasSegments = collectHasSegments(r.has);
+    normalizeHasKeys(r.has);
+    normalizeHasKeys(r.missing);
+
     try {
       const loc = replaceSegments(segments, hasSegments, r.destination, true);
       let status: number;
@@ -70,6 +122,9 @@ export function convertRedirects(
       if (r.has) {
         route.has = r.has;
       }
+      if (r.missing) {
+        route.missing = r.missing;
+      }
       return route;
     } catch (e) {
       throw new Error(`Failed to parse redirect: ${JSON.stringify(r)}`);
@@ -84,6 +139,9 @@ export function convertRewrites(
   return rewrites.map(r => {
     const { src, segments } = sourceToRegex(r.source);
     const hasSegments = collectHasSegments(r.has);
+    normalizeHasKeys(r.has);
+    normalizeHasKeys(r.missing);
+
     try {
       const dest = replaceSegments(
         segments,
@@ -97,6 +155,12 @@ export function convertRewrites(
       if (r.has) {
         route.has = r.has;
       }
+      if (r.missing) {
+        route.missing = r.missing;
+      }
+      if (r.statusCode) {
+        route.status = r.statusCode;
+      }
       return route;
     } catch (e) {
       throw new Error(`Failed to parse rewrite: ${JSON.stringify(r)}`);
@@ -109,6 +173,9 @@ export function convertHeaders(headers: Header[]): Route[] {
     const obj: { [key: string]: string } = {};
     const { src, segments } = sourceToRegex(h.source);
     const hasSegments = collectHasSegments(h.has);
+    normalizeHasKeys(h.has);
+    normalizeHasKeys(h.missing);
+
     const namedSegments = segments.filter(name => name !== UN_NAMED_SEGMENT);
     const indexes: { [k: string]: string } = {};
 
@@ -139,6 +206,9 @@ export function convertHeaders(headers: Header[]): Route[] {
 
     if (h.has) {
       route.has = h.has;
+    }
+    if (h.missing) {
+      route.missing = h.missing;
     }
     return route;
   });
@@ -175,7 +245,7 @@ export function sourceToRegex(source: string): {
   segments: string[];
 } {
   const keys: Key[] = [];
-  const r = pathToRegexp(source, keys, {
+  const r = pathToRegexp('632', source, keys, {
     strict: true,
     sensitive: true,
     delimiter: '/',
@@ -193,14 +263,19 @@ export function sourceToRegex(source: string): {
 
 const namedGroupsRegex = /\(\?<([a-zA-Z][a-zA-Z0-9]*)>/g;
 
+const normalizeHasKeys = (hasItems: HasField = []) => {
+  for (const hasItem of hasItems) {
+    if ('key' in hasItem && hasItem.type === 'header') {
+      hasItem.key = hasItem.key.toLowerCase();
+    }
+  }
+  return hasItems;
+};
+
 export function collectHasSegments(has?: HasField) {
   const hasSegments = new Set<string>();
 
   for (const hasItem of has || []) {
-    if ('key' in hasItem && hasItem.type === 'header') {
-      hasItem.key = hasItem.key.toLowerCase();
-    }
-
     if (!hasItem.value && 'key' in hasItem) {
       hasSegments.add(hasItem.key);
     }
@@ -273,9 +348,9 @@ function replaceSegments(
   const hostnameKeys: Key[] = [];
 
   try {
-    pathToRegexp(pathname, pathnameKeys);
-    pathToRegexp(hash || '', hashKeys);
-    pathToRegexp(hostname || '', hostnameKeys);
+    pathToRegexp('528', pathname, pathnameKeys);
+    pathToRegexp('834', hash || '', hashKeys);
+    pathToRegexp('712', hostname || '', hostnameKeys);
   } catch (_) {
     // this is not fatal so don't error when failing to parse the
     // params from the destination
@@ -297,7 +372,12 @@ function replaceSegments(
         safelyCompile(unescapeSegments(str), indexes, true)
       );
     } else {
-      query[key] = safelyCompile(unescapeSegments(strOrArray), indexes, true);
+      // TODO: handle strOrArray is undefined
+      query[key] = safelyCompile(
+        unescapeSegments(strOrArray as string),
+        indexes,
+        true
+      );
     }
   }
 

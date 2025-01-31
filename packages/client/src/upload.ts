@@ -1,15 +1,17 @@
-import { Agent } from 'https';
+import http from 'http';
+import https from 'https';
+import { Readable } from 'stream';
+import { EventEmitter } from 'node:events';
 import retry from 'async-retry';
 import { Sema } from 'async-sema';
-import fs from 'fs-extra';
 
-import { DeploymentFile } from './utils/hashes';
+import { DeploymentFile, FilesMap } from './utils/hashes';
 import { fetch, API_FILES, createDebug } from './utils';
 import { DeploymentError } from './errors';
 import { deploy } from './deploy';
 import { VercelClientOptions, DeploymentOptions } from './types';
 
-const isClientNetworkError = (err: Error | DeploymentError) => {
+const isClientNetworkError = (err: Error) => {
   if (err.message) {
     // These are common network errors that may happen occasionally and we should retry if we encounter these
     return (
@@ -27,7 +29,7 @@ const isClientNetworkError = (err: Error | DeploymentError) => {
 };
 
 export async function* upload(
-  files: Map<string, DeploymentFile>,
+  files: FilesMap,
   clientOptions: VercelClientOptions,
   deploymentOptions: DeploymentOptions
 ): AsyncIterableIterator<any> {
@@ -39,16 +41,16 @@ export async function* upload(
     return;
   }
 
-  let missingFiles = [];
+  let shas: string[] = [];
 
   debug('Determining necessary files for upload...');
 
   for await (const event of deploy(files, clientOptions, deploymentOptions)) {
     if (event.type === 'error') {
       if (event.payload.code === 'missing_files') {
-        missingFiles = event.payload.missing;
+        shas = event.payload.missing;
 
-        debug(`${missingFiles.length} files are required to upload`);
+        debug(`${shas.length} files are required to upload`);
       } else {
         return yield event;
       }
@@ -64,17 +66,28 @@ export async function* upload(
     }
   }
 
-  const shas = missingFiles;
+  const uploads = shas.map(sha => {
+    return new UploadProgress(sha, files.get(sha)!);
+  });
 
-  yield { type: 'file-count', payload: { total: files, missing: shas } };
+  yield {
+    type: 'file-count',
+    payload: { total: files, missing: shas, uploads },
+  };
 
   const uploadList: { [key: string]: Promise<any> } = {};
   debug('Building an upload list...');
 
   const semaphore = new Sema(50, { capacity: 50 });
-  const agent = new Agent({ keepAlive: true });
+  const defaultAgent = apiUrl?.startsWith('https://')
+    ? new https.Agent({ keepAlive: true })
+    : new http.Agent({ keepAlive: true });
+  const abortControllers = new Set<AbortController>();
+  let aborted = false;
 
-  shas.map((sha: string): void => {
+  shas.forEach((sha, index) => {
+    const uploadProgress = uploads[index];
+
     uploadList[sha] = retry(
       async (bail): Promise<any> => {
         const file = files.get(sha);
@@ -86,28 +99,48 @@ export async function* upload(
 
         await semaphore.acquire();
 
-        const fPath = file.names[0];
-
-        let body: fs.ReadStream | string | null = null;
-
-        const stat = await fs.lstat(fPath);
-        if (stat.isSymbolicLink()) {
-          body = await fs.readlink(fPath);
-        } else {
-          body = fs.createReadStream(fPath);
+        if (aborted) {
+          return bail(new Error('Upload aborted'));
         }
 
         const { data } = file;
+        if (typeof data === 'undefined') {
+          // Directories don't need to be uploaded
+          return;
+        }
+
+        uploadProgress.bytesUploaded = 0;
+
+        // Split out into chunks
+        const body = new Readable();
+        const originalRead = body.read.bind(body);
+        body.read = function (...args) {
+          const chunk = originalRead(...args);
+          if (chunk) {
+            uploadProgress.bytesUploaded += chunk.length;
+            uploadProgress.emit('progress');
+          }
+          return chunk;
+        };
+
+        const chunkSize = 16384; /* 16kb - default Node.js `highWaterMark` */
+        for (let i = 0; i < data.length; i += chunkSize) {
+          const chunk = data.slice(i, i + chunkSize);
+          body.push(chunk);
+        }
+        body.push(null);
 
         let err;
         let result;
+        const abortController = new AbortController();
+        abortControllers.add(abortController);
 
         try {
           const res = await fetch(
             API_FILES,
             token,
             {
-              agent,
+              agent: clientOptions.agent || defaultAgent,
               method: 'POST',
               headers: {
                 'Content-Type': 'application/octet-stream',
@@ -119,9 +152,10 @@ export async function* upload(
               teamId,
               apiUrl,
               userAgent,
+              // @ts-expect-error: typescript is getting confused with the signal types from node (web & server) and node-fetch (server only)
+              signal: abortController.signal,
             },
-            clientOptions.debug,
-            true
+            clientOptions.debug
           );
 
           if (res.status === 200) {
@@ -152,11 +186,6 @@ export async function* upload(
         } catch (e: any) {
           debug(`An unexpected error occurred in upload promise:\n${e}`);
           err = new Error(e);
-        } finally {
-          if (body && typeof body !== 'string') {
-            body.close();
-            body.destroy();
-          }
         }
 
         semaphore.release();
@@ -169,10 +198,15 @@ export async function* upload(
           } else {
             debug('Other error, bailing: ' + err.message);
             // Otherwise we bail
+            if (!aborted) {
+              aborted = true;
+              abortControllers.forEach(controller => controller.abort());
+            }
             return bail(err);
           }
         }
 
+        abortControllers.delete(abortController);
         return result;
       },
       {
@@ -187,9 +221,7 @@ export async function* upload(
 
   while (Object.keys(uploadList).length > 0) {
     try {
-      const event = await Promise.race(
-        Object.keys(uploadList).map((key): Promise<any> => uploadList[key])
-      );
+      const event = await Promise.race(Object.values(uploadList));
 
       delete uploadList[event.payload.sha];
       yield event;
@@ -214,5 +246,17 @@ export async function* upload(
   } catch (e) {
     debug('An unexpected error occurred when starting deployment creation');
     yield { type: 'error', payload: e };
+  }
+}
+
+class UploadProgress extends EventEmitter {
+  sha: string;
+  file: DeploymentFile;
+  bytesUploaded: number;
+  constructor(sha: string, file: DeploymentFile) {
+    super();
+    this.sha = sha;
+    this.file = file;
+    this.bytesUploaded = 0;
   }
 }
