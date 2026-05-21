@@ -1,5 +1,11 @@
 # vercel
 
+## 54.4.0
+
+### Minor Changes
+
+- 9d9532d: Wire builder entrypoint detection into service setup.
+
 ## 54.3.0
 
 ### Minor Changes
